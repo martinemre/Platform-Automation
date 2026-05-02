@@ -1,0 +1,219 @@
+# NOTE:
+# Values are anonymized for public sharing.
+
+trigger: none
+pr: none
+
+pool:
+  name: self-hosted-agent
+
+variables:
+  - group: sql-migration-vars
+
+  # =========================
+  # Source
+  # =========================
+  - name: sourceServer
+    value: xx-xx.database.windows.net
+
+  - name: sourceDatabase
+    value: xx-xx.database.windows.net
+
+  # =========================
+  # Target
+  # =========================
+  - name: targetServer
+    value: xx-xx.database.windows.net
+
+  - name: targetServerLogical
+    value: xx-xx.database.windows.net
+
+  - name: targetDatabase
+    value: xx-xx.database.windows.net
+
+  - name: targetResourceGroup
+    value: xx-xx-xx
+
+  - name: projectName
+    value: Azure-SQL-Migration
+
+  # =========================
+  # SQL SKU
+  # =========================
+  - name: importSku
+    value: P1
+
+  - name: finalSku
+    value: S1
+
+stages:
+# =========================
+# Stage 1 - Export
+# =========================
+- stage: ExportDatabase
+  displayName: Export Source Database
+  jobs:
+    - job: ExportJob
+      displayName: Export SQL DB
+      timeoutInMinutes: 180
+      steps:
+        - task: Bash@3
+          displayName: Export SQL DB
+          inputs:
+            targetType: inline
+            script: |
+              sqlpackage /Action:Export \
+                /SourceServerName:"$(sourceServer)" \
+                /SourceDatabaseName:"$(sourceDatabase)" \
+                /SourceUser:"$(sourceSqlUser)" \
+                /SourcePassword:"$(sourceSqlPassword)" \
+                /TargetFile:"/tmp/$(projectName).bacpac"
+
+# =========================
+# Stage 2 - Rename Existing Target DB
+# =========================
+- stage: RenameTargetDatabase
+  displayName: Rename Existing Target Database
+  dependsOn: ExportDatabase
+  condition: succeeded()
+  jobs:
+    - job: RenameJob
+      displayName: Rename Existing Target DB
+      steps:
+        - task: Bash@3
+          displayName: Rename Target Database
+          inputs:
+            targetType: inline
+            script: |
+              export PATH="$PATH:/opt/mssql-tools/bin"
+
+              TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+              BACKUP_DB_NAME="$(targetDatabase)_backup_${TIMESTAMP}"
+
+              sqlcmd \
+                -S "$(targetServer)" \
+                -U "$(targetSqlUser)" \
+                -P "$(targetSqlPassword)" \
+                -d master \
+                -Q "ALTER DATABASE [$(targetDatabase)] MODIFY NAME = [${BACKUP_DB_NAME}]"
+
+# =========================
+# Stage 3 - Create New Premium DB
+# =========================
+- stage: CreatePremiumDatabase
+  displayName: Create Premium Target Database
+  dependsOn: RenameTargetDatabase
+  condition: succeeded()
+  jobs:
+    - job: CreateDbJob
+      displayName: Create Premium SQL DB
+      steps:
+        - task: AzureCLI@2
+          displayName: Create Premium SQL DB
+          inputs:
+            azureSubscription: 'xx-xx-xx'
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              az sql db create \
+                --resource-group "$(targetResourceGroup)" \
+                --server "$(targetServerLogical)" \
+                --name "$(targetDatabase)" \
+                --service-objective "$(importSku)"
+
+# =========================
+# Stage 4 - Import
+# =========================
+- stage: ImportDatabase
+  displayName: Import Target Database
+  dependsOn: CreatePremiumDatabase
+  condition: succeeded()
+  jobs:
+    - job: ImportJob
+      displayName: Import SQL DB
+      timeoutInMinutes: 240
+      steps:
+        - task: Bash@3
+          displayName: Import SQL DB
+          inputs:
+            targetType: inline
+            script: |
+              sqlpackage /Action:Import \
+                /TargetServerName:"$(targetServer)" \
+                /TargetDatabaseName:"$(targetDatabase)" \
+                /TargetUser:"$(targetSqlUser)" \
+                /TargetPassword:"$(targetSqlPassword)" \
+                /SourceFile:"/tmp/$(projectName).bacpac"
+
+# =========================
+# Stage 5 - Reduce Max Size
+# =========================
+- stage: ReduceDatabaseMaxSize
+  displayName: Reduce Database Max Size
+  dependsOn: ImportDatabase
+  condition: succeeded()
+  jobs:
+    - job: ReduceMaxSizeJob
+      displayName: Reduce SQL DB Max Size
+      steps:
+        - task: AzureCLI@2
+          displayName: Reduce Max Size to 200GB
+          inputs:
+            azureSubscription: 'xx-xx-xx'
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              az sql db update \
+                --resource-group "$(targetResourceGroup)" \
+                --server "$(targetServerLogical)" \
+                --name "$(targetDatabase)" \
+                --max-size 200GB
+
+# =========================
+# Stage 6 - Disable Read Scale
+# =========================
+- stage: DisableReadScale
+  displayName: Disable Read Scale
+  dependsOn: ReduceDatabaseMaxSize
+  condition: succeeded()
+  jobs:
+    - job: DisableReadScaleJob
+      displayName: Disable SQL DB Read Scale
+      steps:
+        - task: AzureCLI@2
+          displayName: Disable Read Scale
+          inputs:
+            azureSubscription: 'xx-xx-xx'
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              az sql db update \
+                --resource-group "$(targetResourceGroup)" \
+                --server "$(targetServerLogical)" \
+                --name "$(targetDatabase)" \
+                --read-scale Disabled
+                
+# =========================
+# Stage 7 - Scale Down to Standard S1
+# =========================
+- stage: DisableReadScale
+  displayName: Scale Down SQL Database
+  dependsOn: DisableReadScale
+  condition: succeeded()
+  jobs:
+    - job: ScaleDownJob
+      displayName: Scale Down SQL DB
+      steps:
+        - task: AzureCLI@2
+          displayName: Scale SQL DB to S1
+          inputs:
+            azureSubscription: 'xx-xx-xx'
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              az sql db update \
+                --resource-group "$(targetResourceGroup)" \
+                --server "$(targetServerLogical)" \
+                --name "$(targetDatabase)" \
+                --service-objective "$(finalSku)"
+

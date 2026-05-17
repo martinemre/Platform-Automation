@@ -196,7 +196,7 @@ stages:
 # =========================
 # Stage 7 - Scale Down to Standard S1
 # =========================
-- stage: DisableReadScale
+- stage: ScaleDownDatabase
   displayName: Scale Down SQL Database
   dependsOn: DisableReadScale
   condition: succeeded()
